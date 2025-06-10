@@ -1,0 +1,126 @@
+name: "Back up a GitHub org/namespace with restic"
+description: "An action to perform and manage retention of encrypted backups for a GitHub organization/namespace, using restic (https://restic.net/)."
+inputs:
+  github_namespace:
+    description: "Organization or user namespace to backup (eg. 'juno-fx' backs up all repos in the juno-fx org)"
+    required: true
+  github_access_token:
+    description: "GitHub access token to use for the backup - must be able to read all target repos in the org/namespace"
+    required: true
+  restic_password:
+    description: "Restic password to use for the backup"
+    required: true
+  restic_image_tag:
+    description: "Restic image tag to use for the backup (default: 'latest')"
+    default: "latest"
+  restic_repository:
+    description: "Restic repository URL to use for the backup, eg. s3:https://s3.us-east-1.amazonaws.com/juno-example-bucket .Upstream docs can be found here: https://restic.readthedocs.io/en/latest/index.html"
+    required: false
+  s3_access_key_id:
+    description: "S3 access key ID to use for the restic backup"
+    required: true
+  s3_secret_access_key:
+    description: "S3 secret access key to use for the restic backup"
+    required: true
+  restic_keep_last:
+    description: "How many last backups to keep. When one of the restic_keep inputs is set, we keep them indefinitely"
+    required: false
+  restic_keep_daily:
+    description: "How many daily backups to keep. When one of the restic_keep inputs is set, we keep them indefinitely"
+    required: false
+  restic_keep_weekly:
+    description: "How many weekly backups to keep. When one of the restic_keep inputs is set, we keep them indefinitely"
+    required: false
+  restic_keep_monthly:
+    description: "How many monthly backups to keep. When one of the restic_keep inputs is set, we keep them indefinitely"
+    required: false
+  validate_private_repos_presence:
+    description: "If true, the action will fail if there are no private repos in the org/namespace. This sanity-checks your token has the correct permissions."
+    default: "false"
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Gather all repos
+      env:
+        GITHUB_NAMESPACE: ${{ inputs.github_namespace }}
+        GITHUB_TOKEN: ${{ inputs.github_access_token }}
+      shell: bash
+      run: |
+        if [ "${{ inputs.validate_private_repos_presence }}" != "false" ]; then
+          private_repos=$(gh repo list $GITHUB_NAMESPACE --limit 1000 --json isPrivate --jq 'map(select(.isPrivate)) | length')
+          if [ "$private_repos" -eq 0 ]; then
+            echo "No private repositories found in the organization/namespace. Please check your access token permissions."
+            exit 1
+          fi
+        fi
+        mkdir github_backup -p
+        cd github_backup
+        rm -rf ./*
+        gh repo list $GITHUB_NAMESPACE --limit 1000 | while read -r repo _; do
+          if [ ! -d ${repo} ]
+          then
+            gh repo clone "${repo}" "${repo}"
+          fi
+        done
+    - name: Run restic backup
+      env:
+        RESTIC_PASSWORD: ${{ inputs.restic_password }}
+        RESTIC_REPOSITORY: "${{ inputs.restic_repository }}"
+        AWS_ACCESS_KEY_ID: ${{ inputs.s3_access_key_id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.s3_secret_access_key }}
+      shell: bash
+      run: |
+        # if listing snapshots fails, init the repo
+        docker run --rm \
+          -e RESTIC_PASSWORD \
+          -e RESTIC_REPOSITORY \
+          -e AWS_ACCESS_KEY_ID \
+          -e AWS_SECRET_ACCESS_KEY \
+          restic/restic:${{ inputs.restic_image_tag }} snapshots || 
+          docker run --rm \
+          -e RESTIC_PASSWORD \
+          -e RESTIC_REPOSITORY \
+          -e AWS_ACCESS_KEY_ID \
+          -e AWS_SECRET_ACCESS_KEY \
+          restic/restic:${{ inputs.restic_image_tag }} init
+        docker run --rm \
+          -e RESTIC_PASSWORD \
+          -e RESTIC_REPOSITORY \
+          -e AWS_ACCESS_KEY_ID \
+          -e AWS_SECRET_ACCESS_KEY \
+          -v "${PWD}/github_backup:/backup" \
+          restic/restic:${{ inputs.restic_image_tag }} backup /backup
+
+    - name: Run restic prune, cleaning up old backups
+      if: ${{ inputs.restic_keep_last || inputs.restic_keep_daily || inputs.restic_keep_weekly || inputs.restic_keep_monthly }}
+      env:
+        RESTIC_PASSWORD: ${{ inputs.restic_password }}
+        RESTIC_REPOSITORY: ${{ inputs.restic_repository }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.s3_access_key_id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.s3_secret_access_key }}
+      shell: bash
+      run: |
+        restic_flags=""
+        if [ -n "${{ inputs.restic_keep_last }}" ]; then
+          restic_flags+=" --keep-last ${{ inputs.restic_keep_last }}"
+        fi
+        if [ -n "${{ inputs.restic_keep_daily }}" ]; then
+          restic_flags+=" --keep-daily ${{ inputs.restic_keep_daily }}"
+        fi
+        if [ -n "${{ inputs.restic_keep_weekly }}" ]; then
+          restic_flags+=" --keep-weekly ${{ inputs.restic_keep_weekly }}"
+        fi
+        if [ -n "${{ inputs.restic_keep_monthly }}" ]; then
+          restic_flags+=" --keep-monthly ${{ inputs.restic_keep_monthly }}"
+        fi
+
+        # default grouping includes the host - which changes from CI run to CI run.
+        # We only group by paths, otherwise we'd never rotate the backups per the flags
+        docker run --rm \
+          -e RESTIC_PASSWORD \
+          -e RESTIC_REPOSITORY \
+          -e AWS_ACCESS_KEY_ID \
+          -e AWS_SECRET_ACCESS_KEY \
+          restic/restic:${{ inputs.restic_image_tag }} forget --group-by "paths" --prune $restic_flags
